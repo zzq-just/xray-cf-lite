@@ -58,6 +58,8 @@ x
 
 等效于每次联网拉取最新脚本执行，不在本地留文件。
 
+如果部署中断且没有生成 `state.json`，可使用仓库中的 `uninstall_xray_cf_lite.sh` 彻底清理本机残留。该脚本不会在缺少回滚状态时盲目修改 Cloudflare，重新安装前需检查对应域名的 DNS、SSL 和 Origin Rules。
+
 ## 功能
 
 ```
