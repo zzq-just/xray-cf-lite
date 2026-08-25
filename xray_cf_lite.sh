@@ -13,7 +13,7 @@ LAST_LINKS_PATH="$(pwd)/cf_lite_last_links.txt"
 CF_API="https://api.cloudflare.com/client/v4"
 MANAGED_PREFIX="xray-cf-lite "
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
-SUB_BASE="https://yx-auto.pages.dev"
+SUB_BASE="https://yx-auto.coreo.de5.net"
 
 declare -A PROTO_SUFFIX=([vless]="vl" [trojan]="tr" [vmess]="vm")
 declare -A PROTO_LABEL=([vless]="VLESS" [trojan]="TROJAN" [vmess]="VMESS")
@@ -29,15 +29,7 @@ need_cmd(){ command -v "$1" &>/dev/null || die "缺少依赖: $1"; }
 
 
 urlencode() {
-    local s="$1" c
-    local -i i
-    for ((i=0; i<${#s}; i++)); do
-        c="${s:i:1}"
-        case "$c" in
-            [a-zA-Z0-9.~_-]) printf '%s' "$c" ;;
-            *) printf '%%%02X' "'$c" ;;
-        esac
-    done
+    jq -rn --arg value "$1" '$value | @uri'
 }
 
 gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]'; }
@@ -556,18 +548,18 @@ write_xray_config() {
 
 # ── 订阅链接 ─────────────────────────────────────────
 build_link() {
-    local uid="$1" domain="$2" proto="$3" path="$4"
+    local uid="$1" domain="$2" proto="$3" path="$4" prefix="${5:-}"
     local ev="no" et="no" evm="no"
     case "$proto" in vless) ev="yes";; trojan) et="yes";; vmess) evm="yes";; esac
-    echo "${SUB_BASE}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")"
+    echo "${SUB_BASE}/${uid}/sub?domain=${domain}&epd=yes&epi=yes&egi=no&dkby=yes&ev=${ev}&et=${et}&mess=${evm}&path=$(urlencode "$path")&prefix=$(urlencode "$prefix")"
 }
 
 gen_all_links() {
-    local uid="$1" domain="$2" routes_json="$3"
+    local uid="$1" domain="$2" routes_json="$3" prefix="${4:-}"
     local links_json='{}'
     local proto path link
     while IFS=$'\t' read -r proto path; do
-        link=$(build_link "$uid" "$domain" "$proto" "$path")
+        link=$(build_link "$uid" "$domain" "$proto" "$path" "$prefix")
         links_json=$(echo "$links_json" | jq --arg p "$proto" --arg l "$link" '. + {($p):$l}')
     done < <(echo "$routes_json" | jq -r '.[] | [.protocol, .path] | @tsv')
     echo "$links_json"
@@ -630,6 +622,14 @@ prompt_path_prefix() {
     [[ -z "$pfx" ]] && pfx="/${default}"
     [[ "$pfx" == /* ]] || pfx="/${pfx}"
     echo "$pfx"
+}
+
+prompt_sub_prefix() {
+    local default="${1:-}" prompt="订阅节点前缀" sub_prefix
+    [[ -n "$default" ]] && prompt+="(例如 US；当前=${default}，留空=不改，输入 -=清空)" || prompt+="(例如 US，留空=不设置)"
+    read -rp "${prompt}: " sub_prefix
+    [[ "$sub_prefix" == "-" ]] && { echo ""; return; }
+    [[ -n "$sub_prefix" ]] && echo "$sub_prefix" || echo "$default"
 }
 
 # 生成路由 JSON，NAT 和直连通用
@@ -727,6 +727,8 @@ do_install() {
     local short_id="${uid:0:8}"
     local path_prefix
     path_prefix=$(prompt_path_prefix "$short_id")
+    local sub_prefix
+    sub_prefix=$(prompt_sub_prefix)
 
     local routes_json
     routes_json=$(build_routes "$net_mode" "$path_prefix" "${#protocols[@]}" "${protocols[@]}")
@@ -737,6 +739,7 @@ do_install() {
     echo "  域名:  $domain"
     echo "  UUID:  $uid"
     echo "  模式:  $net_mode"
+    echo "  订阅节点前缀: ${sub_prefix:-未设置}"
     echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
     echo
     read -rp "确认部署? (Y/n): " confirm
@@ -770,7 +773,7 @@ do_install() {
 
     # 订阅
     local links_json
-    links_json=$(gen_all_links "$uid" "$domain" "$routes_json")
+    links_json=$(gen_all_links "$uid" "$domain" "$routes_json" "$sub_prefix")
     save_links_snapshot "$domain" "$uid" "$links_json"
 
     # 状态
@@ -785,11 +788,12 @@ do_install() {
     [[ -n "$routes_json" ]]         || routes_json="[]"
     save_state "$(jq -n \
         --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" \
+        --arg prefix "$sub_prefix" \
         --argjson routes "$routes_json" \
         --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
         --arg ssl "$ssl_before" --argjson orbk "$origin_rules_before" --argjson links "$links_json" \
         --argjson secbk "$security_backup" \
-        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,routes:$routes,
+        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,sub_prefix:$prefix,routes:$routes,
           managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
           ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}')"
 
@@ -861,28 +865,32 @@ do_modify() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
 
-    local domain uid routes_json net_mode
+    local domain uid routes_json net_mode sub_prefix
     domain=$(echo "$state" | jq -r '.domain')
     uid=$(echo "$state" | jq -r '.uuid')
     routes_json=$(echo "$state" | jq '.routes')
     net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
+    sub_prefix=$(echo "$state" | jq -r '.sub_prefix // ""')
 
     echo
     echo "当前配置 ($net_mode):"
     echo "  域名: $domain  UUID: $uid"
+    echo "  订阅节点前缀: ${sub_prefix:-未设置}"
     echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
     echo
     echo "  1. 修改 UUID"
     echo "  2. 修改端口"
     echo "  3. 修改 WS 路径"
     echo "  4. 全部修改"
+    echo "  5. 修改订阅节点前缀(prefix，例如 US)"
     echo "  0. 返回"
     echo
-    read -rp "请选择 [0-4]: " mc
+    read -rp "请选择 [0-5]: " mc
 
-    local new_uid="$uid" new_routes="$routes_json" changed=false
+    local new_uid="$uid" new_routes="$routes_json" new_sub_prefix="$sub_prefix"
+    local changed=false node_changed=false
 
-    [[ "$mc" =~ ^[0-4]$ ]] || die "无效选项"
+    [[ "$mc" =~ ^[0-5]$ ]] || die "无效选项"
     [[ "$mc" == "0" ]] && return
 
     if [[ "$mc" == "1" || "$mc" == "4" ]]; then
@@ -893,7 +901,7 @@ do_modify() {
         else
             new_uid=$(gen_uuid)
         fi
-        changed=true; ok "UUID: $new_uid"
+        changed=true; node_changed=true; ok "UUID: $new_uid"
     fi
 
     if [[ "$mc" == "2" || "$mc" == "4" ]]; then
@@ -911,7 +919,7 @@ do_modify() {
                     new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson l "$((lp))" --argjson c "$((cp))" '.[$i].listen_port=$l|.[$i].cf_port=$c')
                     idx=$((idx+1))
                 done
-                changed=true; ok "端口已更新"
+                changed=true; node_changed=true; ok "端口已更新"
             fi
         else
             echo "当前端口: $(echo "$new_routes" | jq -r '[.[].listen_port|tostring] | join(",")')"
@@ -925,7 +933,7 @@ do_modify() {
                     new_routes=$(echo "$new_routes" | jq --argjson i $idx --argjson p "$((np))" '.[$i].listen_port=$p|.[$i].cf_port=$p')
                     idx=$((idx+1))
                 done
-                changed=true; ok "端口已更新"
+                changed=true; node_changed=true; ok "端口已更新"
             fi
         fi
     fi
@@ -936,24 +944,33 @@ do_modify() {
         if [[ -n "$np" ]]; then
             [[ "$np" == /* ]] || np="/${np}"
             new_routes=$(echo "$new_routes" | jq --arg pfx "$np" '[.[]|.path=($pfx+"-"+(if .protocol=="vless" then "vl" elif .protocol=="trojan" then "tr" else "vm" end))]')
-            changed=true; ok "路径已更新"
+            changed=true; node_changed=true; ok "路径已更新"
         fi
+    fi
+
+    if [[ "$mc" == "4" || "$mc" == "5" ]]; then
+        new_sub_prefix=$(prompt_sub_prefix "$sub_prefix")
+        [[ "$new_sub_prefix" != "$sub_prefix" ]] && changed=true
+        ok "订阅节点前缀: ${new_sub_prefix:-未设置}"
     fi
 
     [[ "$changed" == "true" ]] || { echo "无修改"; return; }
 
-    write_xray_config "$(gen_xray_config "$new_routes" "$new_uid")"
-    restart_xray
+    if [[ "$node_changed" == "true" ]]; then
+        write_xray_config "$(gen_xray_config "$new_routes" "$new_uid")"
+        restart_xray
 
-    if load_cf_account; then
-        apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
-        ok "Origin Rules 已更新"
+        if load_cf_account; then
+            apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
+            ok "Origin Rules 已更新"
+        fi
     fi
 
-    local links_json; links_json=$(gen_all_links "$new_uid" "$domain" "$new_routes")
+    local links_json; links_json=$(gen_all_links "$new_uid" "$domain" "$new_routes" "$new_sub_prefix")
     save_links_snapshot "$domain" "$new_uid" "$links_json"
-    save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_routes" --argjson l "$links_json" --arg s "${new_uid:0:8}" \
-        '.uuid=$u|.short_id=$s|.routes=$r|.links=$l')"
+    save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_routes" --argjson l "$links_json" \
+        --arg s "${new_uid:0:8}" --arg prefix "$new_sub_prefix" \
+        '.uuid=$u|.short_id=$s|.sub_prefix=$prefix|.routes=$r|.links=$l')"
 
     echo; ok "配置已更新"; print_links "$links_json"
 }
@@ -967,6 +984,7 @@ do_show_config() {
     echo "域名:  $(echo "$state" | jq -r '.domain')"
     echo "UUID:  $(echo "$state" | jq -r '.uuid')"
     echo "模式:  $(echo "$state" | jq -r '.net_mode // "direct"')"
+    echo "订阅节点前缀: $(echo "$state" | jq -r '.sub_prefix // "未设置" | if . == "" then "未设置" else . end')"
     echo
     echo "入站:"
     echo "$state" | jq -r '.routes[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
@@ -1034,8 +1052,10 @@ do_update_ports() {
             ok "DNS 已更新: $domain -> $public_ip"
         fi
 
-        local uid; uid=$(echo "$state" | jq -r '.uuid')
-        local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
+        local uid sub_prefix
+        uid=$(echo "$state" | jq -r '.uuid')
+        sub_prefix=$(echo "$state" | jq -r '.sub_prefix // ""')
+        local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes" "$sub_prefix")
         save_links_snapshot "$domain" "$uid" "$links_json"
         save_state "$(echo "$state" | jq --argjson r "$new_routes" --argjson l "$links_json" '.routes=$r|.links=$l')"
 
@@ -1104,7 +1124,8 @@ do_switch_net_mode() {
     apply_origin_rules "$zone_id" "$domain" "$new_routes"
     ok "Origin Rules 已更新"
 
-    local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes")
+    local sub_prefix; sub_prefix=$(echo "$state" | jq -r '.sub_prefix // ""')
+    local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes" "$sub_prefix")
     save_links_snapshot "$domain" "$uid" "$links_json"
     save_state "$(echo "$state" | jq --arg m "$target" --argjson r "$new_routes" --argjson l "$links_json" \
         '.net_mode=$m | .routes=$r | .links=$l')"
@@ -1124,12 +1145,17 @@ do_restart() {
 # ── 主入口 ────────────────────────────────────────────
 ensure_shortcut() {
     local target="/usr/local/bin/x"
-    [[ -f "$target" ]] && return
-    cat > "$target" << 'SCEOF'
-#!/bin/sh
-exec bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/xray-cf-lite/main/xray_cf_lite.sh) "$@"
+    local expected
+    expected=$(cat << 'SCEOF'
+#!/usr/bin/env bash
+exec bash <(curl -fsSL "https://raw.githubusercontent.com/zzq-just/xray-cf-lite/main/xray_cf_lite.sh?ts=$(date +%s)") "$@"
 SCEOF
-    chmod +x "$target"
+)
+    if [[ ! -f "$target" || "$(cat "$target" 2>/dev/null)" != "$expected" ]]; then
+        printf '%s\n' "$expected" > "$target"
+        chmod +x "$target"
+        ok "快捷命令 x 已更新"
+    fi
 }
 
 main() {
@@ -1152,7 +1178,7 @@ main() {
     echo "  1. 安装节点"
     echo "  2. 卸载"
     echo "  3. 查看订阅"
-    echo "  4. 修改配置(UUID/端口/路径)"
+    echo "  4. 修改配置(UUID/端口/路径/节点前缀)"
     echo "  5. 查看当前配置"
     echo "  6. 更新外部端口(NAT换端口)"
     echo "  7. 重启 xray"

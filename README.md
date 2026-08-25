@@ -47,7 +47,7 @@
 
 ```bash
 apk add bash curl jq
-bash <(curl -fsSL https://raw.githubusercontent.com/byJoey/xray-cf-lite/main/xray_cf_lite.sh)
+exec bash <(curl -fsSL "https://raw.githubusercontent.com/zzq-just/xray-cf-lite/main/xray_cf_lite.sh?ts=$(date +%s)") "$@"
 ```
 
 首次运行后自动注册快捷命令 `x`，之后直接输入：
@@ -64,7 +64,7 @@ x
 1. 安装节点        部署 xray + 配置 CF（DNS/SSL/Origin Rules）+ 生成订阅链接
 2. 卸载            停止 xray + 回滚 CF 配置(DNS/SSL/Origin Rules) + 清理本地状态/凭据/订阅快照
 3. 查看订阅        显示上次生成的订阅链接
-4. 修改配置        修改 UUID / 端口 / WS 路径（可单改或全改）
+4. 修改配置        修改 UUID / 端口 / WS 路径 / 订阅节点前缀（可单改或全改）
 5. 查看当前配置    显示域名、UUID、端口映射、xray 服务状态、订阅链接
 6. 更新外部端口    NAT 换端口专用：只更新 CF Origin Rules，不重启 xray
 ```
@@ -79,6 +79,9 @@ x
 | UUID | 节点身份标识 | 自动生成 |
 | 端口 | xray 监听端口 | 随机（直连）/ 手动输入映射（NAT） |
 | WS 路径前缀 | WebSocket 路径 | `/{UUID前8位}` |
+| 订阅节点前缀 | 通过订阅链接的 `prefix` 参数设置，例如 `US` | 不设置 |
+
+订阅节点前缀可在安装时设置，也可在主菜单 `4. 修改配置` 中修改。输入 `US` 后，生成的订阅链接会包含 `prefix=US`。
 
 ## NAT 端口映射
 
