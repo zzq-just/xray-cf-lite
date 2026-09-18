@@ -170,6 +170,53 @@ prompt_net_mode() {
     esac
 }
 
+# 返回已存在的 WARP 网卡名。优先精确匹配，再兼容常见的 Cloudflare WARP / wgcf 命名。
+# 网卡名由系统读取，避免用户手动填写后因拼写错误导致 xray 无法启动。
+detect_warp_interface() {
+    local interfaces=() iface normalized
+    if command -v ip &>/dev/null; then
+        while IFS= read -r iface; do
+            [[ -n "$iface" ]] && interfaces+=("${iface%%@*}")
+        done < <(ip -o link show 2>/dev/null | awk '{sub(/^[0-9]+: /, ""); sub(/:.*/, ""); print}')
+    fi
+    if [[ ${#interfaces[@]} -eq 0 && -d /sys/class/net ]]; then
+        for iface in /sys/class/net/*; do
+            [[ -e "$iface" ]] && interfaces+=("${iface##*/}")
+        done
+    fi
+
+    for iface in "${interfaces[@]}"; do
+        normalized=$(tr '[:upper:]' '[:lower:]' <<< "$iface")
+        [[ "$normalized" == "cloudflarewarp" ]] && { echo "$iface"; return; }
+    done
+    for iface in "${interfaces[@]}"; do
+        normalized=$(tr '[:upper:]' '[:lower:]' <<< "$iface")
+        [[ "$normalized" == "warp" ]] && { echo "$iface"; return; }
+    done
+    for iface in "${interfaces[@]}"; do
+        normalized=$(tr '[:upper:]' '[:lower:]' <<< "$iface")
+        [[ "$normalized" == cloudflarewarp* || "$normalized" == warp* || "$normalized" == wgcf* ]] && {
+            echo "$iface"
+            return
+        }
+    done
+    return 1
+}
+
+prompt_warp_interface() {
+    local answer warp_interface
+    read -rp "使用 WARP 出站? (y/N): " answer
+    case "${answer,,}" in
+        ""|n|no) echo "" ;;
+        y|yes)
+            warp_interface=$(detect_warp_interface) || die "未检测到 WARP 网卡（支持 CloudflareWARP、warp、wgcf 等名称）。请先启动 WARP 后重试"
+            ok "将通过 WARP 网卡出站: $warp_interface"
+            echo "$warp_interface"
+            ;;
+        *) die "无效选项: $answer（请输入 y 或 n）" ;;
+    esac
+}
+
 get_listening_ports() {
     ss -tlnH 2>/dev/null | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | tr '\n' ' '
 }
@@ -506,8 +553,8 @@ external_routing_rules() {
 }
 
 gen_xray_config() {
-    local routes_json="$1" uid="$2"
-    local inbounds
+    local routes_json="$1" uid="$2" warp_interface="${3:-}"
+    local inbounds inbound_tags
     inbounds=$(echo "$routes_json" | jq --arg uid "$uid" '[
         .[] | {
             tag: ("in-" + .protocol + "-" + (.listen_port|tostring)),
@@ -524,6 +571,7 @@ gen_xray_config() {
             sniffing: { enabled:true, destOverride:["http","tls"] }
         }
     ]')
+    inbound_tags=$(echo "$inbounds" | jq '[.[].tag]')
     # 保留外部工具（如 fanout）注入的出站与分流规则。
     # 它们统一带 EXTERNAL_TAG_PREFIX 前缀，重新生成配置时原样带过来，
     # 否则用户在这里改个 UUID 就会把已配好的出口绑定悄悄冲掉，流量默默回到直连。
@@ -531,11 +579,21 @@ gen_xray_config() {
     ext_outbounds=$(external_outbounds)
     ext_rules=$(external_routing_rules "$routes_json")
 
-    jq -n --argjson inb "$inbounds" --argjson eob "$ext_outbounds" --argjson erl "$ext_rules" '{
+    jq -n --argjson inb "$inbounds" --argjson tags "$inbound_tags" --arg warp_if "$warp_interface" --argjson eob "$ext_outbounds" --argjson erl "$ext_rules" '{
         log:{loglevel:"warning"},
         inbounds:$inb,
-        outbounds:([{tag:"direct",protocol:"freedom"},{tag:"block",protocol:"blackhole"}] + $eob),
-        routing:{domainStrategy:"AsIs",rules:([{type:"field",outboundTag:"block",protocol:["bittorrent"]}] + $erl)}
+        outbounds:([
+            {tag:"direct",protocol:"freedom"},
+            {tag:"block",protocol:"blackhole"}
+        ] + (if $warp_if == "" then [] else [{
+            tag:"warp", protocol:"freedom", settings:{},
+            streamSettings:{sockopt:{interface:$warp_if}}
+        }] end) + $eob),
+        routing:{domainStrategy:"AsIs",rules:(
+            [{type:"field",outboundTag:"block",protocol:["bittorrent"]}]
+            + (if $warp_if == "" then [] else [{type:"field",inboundTag:$tags,outboundTag:"warp"}] end)
+            + $erl
+        )}
     }'
 }
 
@@ -701,6 +759,9 @@ do_install() {
     net_mode=$(prompt_net_mode "$(detect_nat)")
     ok "网络模式: $(net_mode_label "$net_mode")"
 
+    local warp_interface
+    warp_interface=$(prompt_warp_interface)
+
     prompt_cf
 
     # 输入域名并校验能匹配到 CF Zone，失败可重输
@@ -739,6 +800,7 @@ do_install() {
     echo "  域名:  $domain"
     echo "  UUID:  $uid"
     echo "  模式:  $net_mode"
+    echo "  出站:  ${warp_interface:+WARP ($warp_interface)}${warp_interface:-直连}"
     echo "  订阅节点前缀: ${sub_prefix:-未设置}"
     echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
     echo
@@ -747,7 +809,7 @@ do_install() {
 
     # xray
     local config
-    config=$(gen_xray_config "$routes_json" "$uid")
+    config=$(gen_xray_config "$routes_json" "$uid" "$warp_interface")
     write_xray_config "$config"
     [[ "$INIT_SYSTEM" == "openrc" && ! -f "$XRAY_OPENRC_SCRIPT" ]] && write_openrc_script && ok "OpenRC 服务脚本已创建"
     restart_xray
@@ -787,13 +849,13 @@ do_install() {
     [[ -n "$links_json" ]]          || links_json="{}"
     [[ -n "$routes_json" ]]         || routes_json="[]"
     save_state "$(jq -n \
-        --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" \
+        --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" --arg warp "$warp_interface" \
         --arg prefix "$sub_prefix" \
         --argjson routes "$routes_json" \
         --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
         --arg ssl "$ssl_before" --argjson orbk "$origin_rules_before" --argjson links "$links_json" \
         --argjson secbk "$security_backup" \
-        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,sub_prefix:$prefix,routes:$routes,
+        '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,warp_interface:$warp,sub_prefix:$prefix,routes:$routes,
           managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
           ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}')"
 
@@ -865,17 +927,19 @@ do_modify() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
 
-    local domain uid routes_json net_mode sub_prefix
+    local domain uid routes_json net_mode sub_prefix warp_interface
     domain=$(echo "$state" | jq -r '.domain')
     uid=$(echo "$state" | jq -r '.uuid')
     routes_json=$(echo "$state" | jq '.routes')
     net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
+    warp_interface=$(echo "$state" | jq -r '.warp_interface // ""')
     sub_prefix=$(echo "$state" | jq -r '.sub_prefix // ""')
 
     echo
     echo "当前配置 ($net_mode):"
     echo "  域名: $domain  UUID: $uid"
     echo "  订阅节点前缀: ${sub_prefix:-未设置}"
+    echo "  出站: ${warp_interface:+WARP ($warp_interface)}${warp_interface:-直连}"
     echo "$routes_json" | jq -r '.[] | "  \(.protocol)  监听:\(.listen_port)  CF端口:\(.cf_port)  路径:\(.path)"'
     echo
     echo "  1. 修改 UUID"
@@ -957,7 +1021,7 @@ do_modify() {
     [[ "$changed" == "true" ]] || { echo "无修改"; return; }
 
     if [[ "$node_changed" == "true" ]]; then
-        write_xray_config "$(gen_xray_config "$new_routes" "$new_uid")"
+        write_xray_config "$(gen_xray_config "$new_routes" "$new_uid" "$warp_interface")"
         restart_xray
 
         if load_cf_account; then
@@ -984,6 +1048,8 @@ do_show_config() {
     echo "域名:  $(echo "$state" | jq -r '.domain')"
     echo "UUID:  $(echo "$state" | jq -r '.uuid')"
     echo "模式:  $(echo "$state" | jq -r '.net_mode // "direct"')"
+    local warp_interface; warp_interface=$(echo "$state" | jq -r '.warp_interface // ""')
+    echo "出站:  ${warp_interface:+WARP ($warp_interface)}${warp_interface:-直连}"
     echo "订阅节点前缀: $(echo "$state" | jq -r '.sub_prefix // "未设置" | if . == "" then "未设置" else . end')"
     echo
     echo "入站:"
