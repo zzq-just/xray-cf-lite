@@ -460,14 +460,22 @@ origin_rules_without_current_deployment() {
         local legacy_rules
         legacy_rules=$(build_new_origin_rules "$domain" "$routes_json")
         echo "$existing" | jq --argjson legacy "$legacy_rules" '[
-            . as $current |
-            select(any($legacy[];
-                . as $wanted |
-                ($current.description == $wanted.description and
-                 $current.expression == $wanted.expression and
-                 $current.action == $wanted.action and
-                 $current.action_parameters == $wanted.action_parameters)
-            ) | not)
+            $legacy[] | {
+                description: .description,
+                expression: .expression,
+                action: .action,
+                action_parameters: .action_parameters
+            }
+        ] as $legacy_keys |
+        [
+            .[] |
+            {
+                description: .description,
+                expression: .expression,
+                action: .action,
+                action_parameters: .action_parameters
+            } as $current_key |
+            select($legacy_keys | index($current_key) | not)
         ]'
     fi
 }
