@@ -34,6 +34,9 @@ urlencode() {
 
 gen_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen | tr '[:upper:]' '[:lower:]'; }
 
+# 每次部署都有独立标识。Origin Rules 是 Zone 级资源，不能再通过整份快照回滚。
+gen_origin_rule_owner() { gen_uuid | tr -d '-' | cut -c1-12; }
+
 # ── init 系统检测 ─────────────────────────────────────
 INIT_SYSTEM=""
 detect_init() {
@@ -430,12 +433,13 @@ cf_put_origin_rules() {
     echo "$r" | jq -e '.success' &>/dev/null || die "Origin Rules 写入失败: $(echo "$r" | jq -c '.errors')"
 }
 
-# cf_port = 外部端口（CF Origin Rules 转发的目标端口）
+# cf_port = 外部端口（CF Origin Rules 转发的目标端口）。
+# owner 为空仅用于识别旧版本规则；新规则必须携带独立 owner。
 build_new_origin_rules() {
-    local domain="$1" routes_json="$2"
-    echo "$routes_json" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
+    local domain="$1" routes_json="$2" owner="${3:-}"
+    echo "$routes_json" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" --arg o "$owner" '[
         .[] | {
-            description: ($pfx + .protocol + " " + .path),
+            description: ($pfx + (if $o == "" then "" else "[" + $o + "] " end) + .protocol + " " + .path),
             enabled: true,
             expression: ("(http.host eq \"" + $d + "\" and http.request.uri.path eq \"" + .path + "\")"),
             action: "route",
@@ -444,19 +448,50 @@ build_new_origin_rules() {
     ]'
 }
 
+# 输出删除本机规则后的列表。旧版 state 没有 owner，只按完整规则内容精确匹配，
+# 不会再使用安装时保存的整份 Origin Rules 快照。
+origin_rules_without_current_deployment() {
+    local existing="$1" domain="$2" routes_json="$3" owner="${4:-}"
+    if [[ -n "$owner" ]]; then
+        echo "$existing" | jq --arg marker "${MANAGED_PREFIX}[${owner}] " '[
+            .[] | select((.description // "") | startswith($marker) | not)
+        ]'
+    else
+        local legacy_rules
+        legacy_rules=$(build_new_origin_rules "$domain" "$routes_json")
+        echo "$existing" | jq --argjson legacy "$legacy_rules" '[
+            . as $current |
+            select(any($legacy[];
+                . as $wanted |
+                ($current.description == $wanted.description and
+                 $current.expression == $wanted.expression and
+                 $current.action == $wanted.action and
+                 $current.action_parameters == $wanted.action_parameters)
+            ) | not)
+        ]'
+    fi
+}
+
 apply_origin_rules() {
-    local zone_id="$1" domain="$2" routes_json="$3"
+    local zone_id="$1" domain="$2" routes_json="$3" owner="$4" legacy_routes="${5:-}"
     local existing kept new_managed merged
     existing=$(cf_get_origin_rules "$zone_id")
-    kept=$(echo "$existing" | jq --arg d "$domain" --arg pfx "$MANAGED_PREFIX" '[
-        .[] | select(
-            (.description | startswith($pfx) | not) or
-            (.expression | ascii_downcase | contains("http.host eq \"" + ($d|ascii_downcase) + "\"") | not)
-        )
-    ]')
-    new_managed=$(build_new_origin_rules "$domain" "$routes_json")
+    if [[ -n "$legacy_routes" ]]; then
+        kept=$(origin_rules_without_current_deployment "$existing" "$domain" "$legacy_routes")
+    else
+        kept=$(origin_rules_without_current_deployment "$existing" "$domain" "$routes_json" "$owner")
+    fi
+    new_managed=$(build_new_origin_rules "$domain" "$routes_json" "$owner")
     merged=$(jq -n --argjson a "$kept" --argjson b "$new_managed" '$a + $b')
     cf_put_origin_rules "$zone_id" "$merged"
+}
+
+remove_origin_rules() {
+    local zone_id="$1" domain="$2" routes_json="$3" owner="${4:-}"
+    local existing kept
+    existing=$(cf_get_origin_rules "$zone_id")
+    kept=$(origin_rules_without_current_deployment "$existing" "$domain" "$routes_json" "$owner")
+    cf_put_origin_rules "$zone_id" "$kept"
 }
 
 # ── xray 安装 ─────────────────────────────────────────
@@ -815,18 +850,18 @@ do_install() {
     restart_xray
 
     # CF
-    local public_ip dns_before ssl_before origin_rules_before dns_record_id
+    local public_ip dns_before ssl_before dns_record_id origin_rule_owner
     public_ip=$(get_public_ip)
     dns_before=$(cf_get_dns "$zone_id" "$domain" || echo "null")
     [[ "$dns_before" == "" ]] && dns_before="null"
     ssl_before=$(cf_get_ssl "$zone_id")
-    origin_rules_before=$(cf_get_origin_rules "$zone_id")
+    origin_rule_owner=$(gen_origin_rule_owner)
 
     dns_record_id=$(cf_upsert_dns "$zone_id" "$domain" "$public_ip")
     ok "DNS A 记录: $domain -> $public_ip (已代理)"
     cf_set_ssl "$zone_id" "flexible"
     ok "SSL 模式: flexible"
-    apply_origin_rules "$zone_id" "$domain" "$routes_json"
+    apply_origin_rules "$zone_id" "$domain" "$routes_json" "$origin_rule_owner"
     ok "Origin Rules: ${#protocols[@]} 条"
 
     # 安全规则：关闭可能拦截 WS 的设置
@@ -844,20 +879,19 @@ do_install() {
     # jq --argjson 遇到空串会整体失败，导致 state.json 存不下来（存不下就没法改配置/卸载）。
     # CF 接口任何一个返回空都不该拖垮状态保存，这里统一兜底成合法 JSON。
     [[ -n "$dns_before" ]]          || dns_before="null"
-    [[ -n "$origin_rules_before" ]] || origin_rules_before="[]"
     [[ -n "$security_backup" ]]     || security_backup="null"
     [[ -n "$links_json" ]]          || links_json="{}"
     [[ -n "$routes_json" ]]         || routes_json="[]"
     save_state "$(jq -n \
-        --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" --arg warp "$warp_interface" \
+        --arg d "$domain" --arg z "$zone_id" --arg u "$uid" --arg s "$short_id" --arg mode "$net_mode" --arg warp "$warp_interface" --arg oro "$origin_rule_owner" \
         --arg prefix "$sub_prefix" \
         --argjson routes "$routes_json" \
         --arg drid "$dns_record_id" --argjson dex "$dns_existed" --argjson drec "$dns_before" \
-        --arg ssl "$ssl_before" --argjson orbk "$origin_rules_before" --argjson links "$links_json" \
+        --arg ssl "$ssl_before" --argjson links "$links_json" \
         --argjson secbk "$security_backup" \
         '{domain:$d,zone_id:$z,uuid:$u,short_id:$s,net_mode:$mode,warp_interface:$warp,sub_prefix:$prefix,routes:$routes,
           managed_dns_record_id:$drid,dns_backup:{existed:$dex,record:$drec},
-          ssl_backup:$ssl,origin_rules_backup:$orbk,security_backup:$secbk,links:$links}')"
+          ssl_backup:$ssl,origin_rule_owner:$oro,security_backup:$secbk,links:$links}')"
 
     echo
     ok "部署完成"
@@ -881,8 +915,11 @@ do_uninstall() {
     if load_cf_account; then
         local zone_id; zone_id=$(echo "$state" | jq -r '.zone_id // ""')
         if [[ -n "$zone_id" ]]; then
-            cf_put_origin_rules "$zone_id" "$(echo "$state" | jq '.origin_rules_backup // []')"
-            ok "Origin Rules 已恢复"
+            local origin_rule_owner routes_json
+            origin_rule_owner=$(echo "$state" | jq -r '.origin_rule_owner // ""')
+            routes_json=$(echo "$state" | jq '.routes // []')
+            remove_origin_rules "$zone_id" "$domain" "$routes_json" "$origin_rule_owner"
+            ok "Origin Rules 已删除本机规则"
 
             local ssl_bk; ssl_bk=$(echo "$state" | jq -r '.ssl_backup // ""')
             [[ -n "$ssl_bk" ]] && cf_set_ssl "$zone_id" "$ssl_bk" && ok "SSL: $ssl_bk"
@@ -927,13 +964,14 @@ do_modify() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
 
-    local domain uid routes_json net_mode sub_prefix warp_interface
+    local domain uid routes_json net_mode sub_prefix warp_interface origin_rule_owner legacy_routes=""
     domain=$(echo "$state" | jq -r '.domain')
     uid=$(echo "$state" | jq -r '.uuid')
     routes_json=$(echo "$state" | jq '.routes')
     net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
     warp_interface=$(echo "$state" | jq -r '.warp_interface // ""')
     sub_prefix=$(echo "$state" | jq -r '.sub_prefix // ""')
+    origin_rule_owner=$(echo "$state" | jq -r '.origin_rule_owner // ""')
 
     echo
     echo "当前配置 ($net_mode):"
@@ -1025,7 +1063,11 @@ do_modify() {
         restart_xray
 
         if load_cf_account; then
-            apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
+            if [[ -z "$origin_rule_owner" ]]; then
+                legacy_routes="$routes_json"
+                origin_rule_owner=$(gen_origin_rule_owner)
+            fi
+            apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes" "$origin_rule_owner" "$legacy_routes"
             ok "Origin Rules 已更新"
         fi
     fi
@@ -1033,8 +1075,8 @@ do_modify() {
     local links_json; links_json=$(gen_all_links "$new_uid" "$domain" "$new_routes" "$new_sub_prefix")
     save_links_snapshot "$domain" "$new_uid" "$links_json"
     save_state "$(echo "$state" | jq --arg u "$new_uid" --argjson r "$new_routes" --argjson l "$links_json" \
-        --arg s "${new_uid:0:8}" --arg prefix "$new_sub_prefix" \
-        '.uuid=$u|.short_id=$s|.sub_prefix=$prefix|.routes=$r|.links=$l')"
+        --arg s "${new_uid:0:8}" --arg prefix "$new_sub_prefix" --arg oro "$origin_rule_owner" \
+        '.uuid=$u|.short_id=$s|.sub_prefix=$prefix|.routes=$r|.links=$l|.origin_rule_owner=$oro')"
 
     echo; ok "配置已更新"; print_links "$links_json"
 }
@@ -1067,10 +1109,15 @@ do_update_ports() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
 
-    local domain routes_json net_mode
+    local domain routes_json net_mode origin_rule_owner legacy_routes=""
     domain=$(echo "$state" | jq -r '.domain')
     routes_json=$(echo "$state" | jq '.routes')
     net_mode=$(echo "$state" | jq -r '.net_mode // "direct"')
+    origin_rule_owner=$(echo "$state" | jq -r '.origin_rule_owner // ""')
+    if [[ -z "$origin_rule_owner" ]]; then
+        legacy_routes="$routes_json"
+        origin_rule_owner=$(gen_origin_rule_owner)
+    fi
 
     echo
     echo "当前端口映射:"
@@ -1105,7 +1152,7 @@ do_update_ports() {
 
         # 只更新 CF Origin Rules，不动 xray
         load_cf_account || die "未找到 CF 凭据"
-        apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes"
+        apply_origin_rules "$(echo "$state" | jq -r '.zone_id')" "$domain" "$new_routes" "$origin_rule_owner" "$legacy_routes"
         ok "Origin Rules 已更新"
 
         # 同时更新 DNS（公网 IP 可能也变了）
@@ -1123,7 +1170,7 @@ do_update_ports() {
         sub_prefix=$(echo "$state" | jq -r '.sub_prefix // ""')
         local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes" "$sub_prefix")
         save_links_snapshot "$domain" "$uid" "$links_json"
-        save_state "$(echo "$state" | jq --argjson r "$new_routes" --argjson l "$links_json" '.routes=$r|.links=$l')"
+        save_state "$(echo "$state" | jq --argjson r "$new_routes" --argjson l "$links_json" --arg oro "$origin_rule_owner" '.routes=$r|.links=$l|.origin_rule_owner=$oro')"
 
         echo; ok "外部端口已更新"; print_links "$links_json"
     else
@@ -1138,12 +1185,17 @@ do_switch_net_mode() {
     local state; state=$(load_state 2>/dev/null || true)
     [[ -n "$state" ]] || die "未检测到部署"
 
-    local domain zone_id uid cur routes_json
+    local domain zone_id uid cur routes_json origin_rule_owner legacy_routes=""
     domain=$(echo "$state" | jq -r '.domain')
     zone_id=$(echo "$state" | jq -r '.zone_id')
     uid=$(echo "$state" | jq -r '.uuid')
     cur=$(echo "$state" | jq -r '.net_mode // "direct"')
     routes_json=$(echo "$state" | jq '.routes')
+    origin_rule_owner=$(echo "$state" | jq -r '.origin_rule_owner // ""')
+    if [[ -z "$origin_rule_owner" ]]; then
+        legacy_routes="$routes_json"
+        origin_rule_owner=$(gen_origin_rule_owner)
+    fi
 
     echo
     echo "当前模式: $(net_mode_label "$cur")"
@@ -1187,14 +1239,14 @@ do_switch_net_mode() {
     [[ "${confirm,,}" =~ ^(|y|yes)$ ]] || die "已取消"
 
     load_cf_account || die "未找到 CF 凭据"
-    apply_origin_rules "$zone_id" "$domain" "$new_routes"
+    apply_origin_rules "$zone_id" "$domain" "$new_routes" "$origin_rule_owner" "$legacy_routes"
     ok "Origin Rules 已更新"
 
     local sub_prefix; sub_prefix=$(echo "$state" | jq -r '.sub_prefix // ""')
     local links_json; links_json=$(gen_all_links "$uid" "$domain" "$new_routes" "$sub_prefix")
     save_links_snapshot "$domain" "$uid" "$links_json"
-    save_state "$(echo "$state" | jq --arg m "$target" --argjson r "$new_routes" --argjson l "$links_json" \
-        '.net_mode=$m | .routes=$r | .links=$l')"
+    save_state "$(echo "$state" | jq --arg m "$target" --argjson r "$new_routes" --argjson l "$links_json" --arg oro "$origin_rule_owner" \
+        '.net_mode=$m | .routes=$r | .links=$l | .origin_rule_owner=$oro')"
 
     echo; ok "已切换到 $(net_mode_label "$target")"; print_links "$links_json"
 }
